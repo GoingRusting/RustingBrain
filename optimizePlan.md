@@ -37,52 +37,27 @@ with FP32 accumulate), Ryzen 5 7600X, 32 GB DDR5, one NVMe with 116 GB free.
 
 ## Measured Baseline
 
-All figures below were taken on this machine with
-`examples/sweep_arch.rs`, one configuration per process.
+Superseded. `docs/baseline.md` holds the clean-GPU table; the numbers that
+were here were taken while a second training job held 5754 MiB and 100% of
+the device, and the same configurations run **2.14x faster** without it.
 
-```
-v32000 d512 L8 16x512 moe     55.2M tot  35.7M act  16989 tok/s  34.1 days for 50B
-v16384 d512 L8 16x512 moe     47.2M tot  27.7M act  18651 tok/s  31.0 days for 50B
-v16384 d512 L8 16x512 dense   30.9M tot  30.9M act  21295 tok/s  27.2 days for 50B
-v16384 d512 L4 16x512 dense   19.7M tot  19.7M act  37631 tok/s  15.4 days for 50B
-v16384 d512 L8  8x1024 moe    47.2M tot  27.7M act  14453 tok/s  40.0 days for 50B
-```
+The contaminated figures are worth keeping only as the reason Task 0 exists:
+they put MFU at ~15%, which made Tasks 6 and 7 look necessary. Clean MFU is
+30.7-37.0%, and both tasks are closed.
 
-Checkpoint I/O on the default 55.2M model:
+| Configuration | contended | clean | ratio |
+|---|---|---|---|
+| v32000 d512 L8 16x512 moe | 16989 | 36302 | 2.14x |
+| v16384 d512 L8 16x512 moe | 18651 | 40115 | 2.15x |
+| v16384 d512 L8 16x512 dense | 21295 | 43704 | 2.05x |
+| v16384 d512 L8 16x1024 dense | 14453 | 34089 | 2.36x |
 
-```
-save_json       1.23s   686.0 MB
-save_bin F32    0.05s   220.7 MB
-save_optimizer  0.10s
-load_json       1.58s
-load_bin        0.21s
-```
-
-### These numbers are contaminated
-
-While every benchmark above ran, PID 859200 — your own
-`./target/release/train --gpu --mixed-precision --epochs 3 --seq-len 128
---batch-size 128 --learning-rate 4e-4` — held **5754 MiB** and the GPU sat at
-**99-100% utilization, 1957 MHz, 146 W**. Two CUDA processes without MPS
-time-slice the device.
-
-Two consequences, both important:
-
-1. Every `tok/s` figure above is roughly **half** of what a clean run gives.
-   The real single-job throughput is probably 35-45k tok/s, and 50B tokens is
-   probably 14-18 days, not 27-34.
-2. Every OOM recorded during this investigation (batch 24, 12 layers, seq
-   1024 at batch 16) was caused by the other job's 5.7 GB, **not** by the
-   library being memory-hungry. A clean probe showed the library using only
-   ~400 MiB for a 1-layer model, and desktop applications hold ~600 MiB.
-
-So: the memory wall I would otherwise have reported does not exist at the
-size I first measured it. Task 0 exists to establish what is actually true
-before any kernel work is justified by it.
+Every OOM recorded during the investigation (batch 24, 12 layers, seq 1024 at
+batch 16) was that job's 5.7 GB. None of them reproduce on an idle card.
 
 ---
 
-## Task 0: Establish a clean baseline
+## Task 0: Establish a clean baseline — DONE
 
 **Files:**
 - Use: `RustingBrain/examples/sweep_arch.rs` (already written)
@@ -93,7 +68,7 @@ before any kernel work is justified by it.
 - Produces: a recorded table of `tok/s` and peak VRAM per configuration on an
   idle GPU. Tasks 3, 6 and 7 are accepted or rejected against these numbers.
 
-- [ ] **Step 1: Stop the contending training run**
+- [x] **Step 1: Stop the contending training run**
 
 Your current run is at epoch 3 of a 368M-token corpus at `--seq-len 128`. It
 checkpoints every 500 steps to `models/rusting_ogre_2_50m.json`, so stopping
@@ -107,7 +82,7 @@ nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv
 Expected: no `./target/release/train` row. Desktop apps should leave roughly
 600 MiB used.
 
-- [ ] **Step 2: Re-run the architecture sweep**
+- [x] **Step 2: Re-run the architecture sweep**
 
 ```bash
 cd ~/Rusting/RustingBrain
@@ -122,7 +97,7 @@ done
 
 Expected: every configuration that OOM'd before now runs. Record the table.
 
-- [ ] **Step 3: Record peak VRAM for the configuration you intend to train**
+- [x] **Step 3: Record peak VRAM for the configuration you intend to train**
 
 ```bash
 target/release/examples/sweep_arch 16384 512 8 32 512 0 &
@@ -131,7 +106,7 @@ while kill -0 $! 2>/dev/null; do
 done | sort -n | tail -1
 ```
 
-- [ ] **Step 4: Compute MFU and write it down**
+- [x] **Step 4: Compute MFU and write it down**
 
 ```
 FLOPs/token  = 6 * active_params + 12 * n_layers * seq_len * d_model
@@ -144,7 +119,7 @@ Under contention this was 3.9 TFLOPS, ~15% MFU. If the clean number is above
 straight to Task 8 and accept the wall-clock. **This is the decision this task
 exists to inform — do not skip it.**
 
-- [ ] **Step 5: Commit the baseline**
+- [x] **Step 5: Commit the baseline**
 
 ```bash
 git add docs/baseline.md examples/sweep_arch.rs examples/vram_probe.rs
@@ -153,7 +128,7 @@ git commit -m "docs: record clean-GPU training throughput baseline"
 
 ---
 
-## Task 1: Binary checkpoints in the training loop
+## Task 1: Binary checkpoints in the training loop — DONE
 
 `save_bin` and `load_bin` already exist in `RustingBrain`. `RustingLLM` still
 calls `save_json`. Five checkpoint files in `models/` hold 2.1 GB today, on a
@@ -171,7 +146,7 @@ disk with 116 GB free that Task 2 wants 50 GB of.
   and `TransformerLm::load_bin(path) -> Result<Self, NetworkError>`.
 - Produces: checkpoints at `models/*.rbw` instead of `models/*.json`.
 
-- [ ] **Step 1: Change the checkpoint default and the save call**
+- [x] **Step 1: Change the checkpoint default and the save call**
 
 In `train.rs`, change the `--checkpoint` default:
 
@@ -197,13 +172,13 @@ and the body of `checkpoint_model`:
     };
 ```
 
-- [ ] **Step 2: Change the resume path**
+- [x] **Step 2: Change the resume path**
 
 ```rust
         let mut model = TransformerLm::load_bin(&args.checkpoint)?;
 ```
 
-- [ ] **Step 3: Update the import**
+- [x] **Step 3: Update the import**
 
 ```rust
 use rusting_brain::{Precision, TransformerLm};
@@ -211,7 +186,7 @@ use rusting_brain::{Precision, TransformerLm};
 
 Delete the old `use rusting_brain::transformer::TransformerLm;` line.
 
-- [ ] **Step 4: Verify a save/resume round trip**
+- [x] **Step 4: Verify a save/resume round trip**
 
 ```bash
 cd ~/Rusting/RustingLLM
@@ -230,7 +205,7 @@ Expected: `roundtrip.rbw` is ~221 MB, not ~670 MB. The resumed run prints
 within a few percent of the loss printed just before the interrupt. A first
 loss that jumps by more than ~20% means the optimizer state did not restore.
 
-- [ ] **Step 5: Convert the checkpoint you care about, then reclaim the disk**
+- [x] **Step 5: Convert the checkpoint you care about, then reclaim the disk**
 
 ```bash
 cd ~/Rusting/RustingLLM
@@ -260,7 +235,7 @@ Only once that prints sensible output:
 rm models/checkpoint_50m.json models/rusting_ogre_1_50m.json models/rusting_ogre_2_50m.json
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/bin/train.rs src/bin/generate.rs src/bin/convert_checkpoint.rs
@@ -273,7 +248,7 @@ faster resume. Do it because Task 2 needs the disk, not because it is fast.
 
 ---
 
-## Task 2: Memory-mapped token stream
+## Task 2: Memory-mapped token stream — DONE
 
 This is the task that makes 50B tokens possible at all. Today
 `train.rs:106-117` reads the whole corpus into a `String`, tokenizes it, and
@@ -300,7 +275,7 @@ tokens is 100 GB on disk and zero bytes of resident heap.
   - `TokenFile::sequence(&self, index: usize, seq_len: usize, out: &mut Vec<u32>)`
 - Consumed by: Task 4, which batches over `sequence` indices.
 
-- [ ] **Step 1: Add the dependency**
+- [x] **Step 1: Add the dependency**
 
 `memmap2` is the one new crate this plan allows. Writing a correct mmap
 wrapper by hand is more unsafe code than it is worth.
@@ -309,7 +284,7 @@ wrapper by hand is more unsafe code than it is worth.
 memmap2 = "0.9"
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Create `RustingLLM/src/tokens.rs`:
 
@@ -418,7 +393,7 @@ Add to `Cargo.toml`:
 tempfile = "3"
 ```
 
-- [ ] **Step 3: Run the tests to verify they fail**
+- [x] **Step 3: Run the tests to verify they fail**
 
 ```bash
 cd ~/Rusting/RustingLLM
@@ -427,7 +402,7 @@ cargo test --lib tokens
 
 Expected: FAIL — `tokens.rs` is not declared as a module yet.
 
-- [ ] **Step 4: Declare the module**
+- [x] **Step 4: Declare the module**
 
 Add to `RustingLLM/src/lib.rs`:
 
@@ -435,7 +410,7 @@ Add to `RustingLLM/src/lib.rs`:
 pub mod tokens;
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [x] **Step 5: Run the tests to verify they pass**
 
 ```bash
 cargo test --lib tokens
@@ -443,7 +418,7 @@ cargo test --lib tokens
 
 Expected: 2 passed.
 
-- [ ] **Step 6: Write the offline tokenizer**
+- [x] **Step 6: Write the offline tokenizer**
 
 Create `RustingLLM/src/bin/tokenize_corpus.rs`:
 
@@ -524,7 +499,7 @@ fn main() -> Result<()> {
 }
 ```
 
-- [ ] **Step 7: Tokenize the corpus you already have**
+- [x] **Step 7: Tokenize the corpus you already have**
 
 ```bash
 cd ~/Rusting/RustingLLM
@@ -536,7 +511,7 @@ Expected: ~368M tokens, ~0.74 GB. Compare the token count to the
 `2877837 sequences x 128` your current run reports — they should agree to
 within a rounding of the final partial chunk.
 
-- [ ] **Step 8: Replace corpus loading in the training loop**
+- [x] **Step 8: Replace corpus loading in the training loop**
 
 In `train.rs`, delete the `let mut sequences = Vec::new(); ... ` block at
 lines 105-119 and replace it with:
@@ -585,7 +560,7 @@ not over 2.87M heap-allocated vectors:
             // ... the rest of the loop body is unchanged
 ```
 
-- [ ] **Step 9: Verify RAM dropped and the loss curve did not move**
+- [x] **Step 9: Verify RAM dropped and the loss curve did not move**
 
 ```bash
 cargo run --release --features cuda --bin train -- \
@@ -599,7 +574,7 @@ Expected: RSS under 400 MB, down from 2.78 GB. The first few reported
 `lm_loss` values should sit in the same range a fresh run reported before
 this change — the data is identical, only its storage moved.
 
-- [ ] **Step 10: Commit**
+- [x] **Step 10: Commit**
 
 ```bash
 git add Cargo.toml src/lib.rs src/tokens.rs src/bin/tokenize_corpus.rs src/bin/train.rs
@@ -612,7 +587,7 @@ disk. This is the prerequisite for every token-count target above ~2B.
 
 ---
 
-## Task 3: Drop the mixture of experts
+## Task 3: Drop the mixture of experts — DONE
 
 Measured, under contention but on identical footing:
 
@@ -635,7 +610,7 @@ holds here.
 **Files:**
 - Modify: `RustingLLM/src/bin/train.rs:159` (the `moe_layers` call)
 
-- [ ] **Step 1: Add a flag rather than deleting the capability**
+- [x] **Step 1: Add a flag rather than deleting the capability**
 
 The library keeps MoE; this run stops using it.
 
@@ -654,7 +629,7 @@ and at the builder:
             .moe_layers(if args.moe { args.n_layers / 4..args.n_layers } else { 0..0 })
 ```
 
-- [ ] **Step 2: Verify both paths still build a model and take a step**
+- [x] **Step 2: Verify both paths still build a model and take a step**
 
 ```bash
 cd ~/Rusting/RustingLLM
@@ -667,7 +642,7 @@ cargo run --release --features cuda --bin train -- --gpu --mixed-precision --moe
 Expected: the dense run reports a higher `tok/s` and the printed parameter
 counts show `1.00x` sparsity for dense against `1.54x` for MoE.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add src/bin/train.rs
@@ -679,7 +654,7 @@ multi-week run.
 
 ---
 
-## Task 4: Gradient accumulation
+## Task 4: Gradient accumulation — DONE
 
 Batch size is currently bounded by VRAM, and the optimizer takes a step for
 every batch. That couples two things that should be independent: how many
@@ -702,7 +677,7 @@ that runs forward and backward without the zeroing and the step.
   is responsible for `zero_grad()` before the first accumulation and
   `step(1.0 / accumulated as f32)` after the last.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to the `tests` module in `RustingBrain/src/transformer.rs`:
 
@@ -733,7 +708,7 @@ Add to the `tests` module in `RustingBrain/src/transformer.rs`:
     }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 ```bash
 cd ~/Rusting/RustingBrain
@@ -742,7 +717,7 @@ cargo test --lib accumulating_two_half_batches
 
 Expected: FAIL — `no method named accumulate_step`.
 
-- [ ] **Step 3: Add the method**
+- [x] **Step 3: Add the method**
 
 In `RustingBrain/src/transformer.rs`, directly after `train_step_batch`:
 
@@ -793,7 +768,7 @@ internally rather than relying on `transformer.rs:837`, move that zeroing out
 into `train_step_batch` so `accumulate_step` accumulates. The test in Step 1
 is what catches it.
 
-- [ ] **Step 4: Run the test to verify it passes**
+- [x] **Step 4: Run the test to verify it passes**
 
 ```bash
 cargo test --lib accumulating_two_half_batches
@@ -802,14 +777,14 @@ cargo test --lib
 
 Expected: the new test passes and all 107 existing tests still pass.
 
-- [ ] **Step 5: Commit the library change**
+- [x] **Step 5: Commit the library change**
 
 ```bash
 git add src/transformer.rs
 git commit -m "feat: add accumulate_step for gradient accumulation"
 ```
 
-- [ ] **Step 6: Use it from the training loop**
+- [x] **Step 6: Use it from the training loop**
 
 Add the argument to `train.rs`:
 
@@ -849,7 +824,7 @@ and restructure the inner loop:
 
 `TokenBatch` needs importing: `use rusting_brain::TokenBatch;`
 
-- [ ] **Step 7: Verify the loss curve is unchanged at equal effective batch**
+- [x] **Step 7: Verify the loss curve is unchanged at equal effective batch**
 
 ```bash
 cd ~/Rusting/RustingLLM
@@ -865,7 +840,7 @@ cargo run --release --features cuda --bin train -- --gpu --mixed-precision \
 Expected: the two runs report `lm_loss` within about 1% of each other at the
 same step count. The second uses roughly a quarter of the activation memory.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add src/bin/train.rs
@@ -878,7 +853,7 @@ doing it, without OOM.
 
 ---
 
-## Task 5: Sequence length, learning-rate schedule, and the run configuration
+## Task 5: Sequence length, learning-rate schedule, and the run configuration — DONE
 
 Two things in the current command line will cost more model quality than
 every throughput item in this plan will buy back.
@@ -903,7 +878,7 @@ field and `TransformerLm::step` re-reads it every call
 **Files:**
 - Modify: `RustingLLM/src/bin/train.rs`
 
-- [ ] **Step 1: Add the schedule arguments**
+- [x] **Step 1: Add the schedule arguments**
 
 ```rust
     /// Linear warmup over this many optimizer steps, then cosine decay.
@@ -919,7 +894,7 @@ field and `TransformerLm::step` re-reads it every call
     total_steps: usize,
 ```
 
-- [ ] **Step 2: Write the schedule**
+- [x] **Step 2: Write the schedule**
 
 Add above `fn main`:
 
@@ -965,7 +940,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 3: Run the test to verify it fails, then passes**
+- [x] **Step 3: Run the test to verify it fails, then passes**
 
 ```bash
 cd ~/Rusting/RustingLLM
@@ -974,7 +949,7 @@ cargo test --bin train the_schedule_warms_up
 
 Expected: FAIL first (function missing), PASS after Step 2 is in place.
 
-- [ ] **Step 4: Apply the schedule each step**
+- [x] **Step 4: Apply the schedule each step**
 
 Immediately before `model.step(1.0 / parts as f32);`:
 
@@ -1007,7 +982,7 @@ Add `rate` to the reporting line so the schedule is visible in the log:
                 );
 ```
 
-- [ ] **Step 5: Verify on a short run**
+- [x] **Step 5: Verify on a short run**
 
 ```bash
 cargo run --release --features cuda --bin train -- --gpu --mixed-precision \
@@ -1019,7 +994,7 @@ Expected: `lr=` climbs from near zero to 4.00e-4 over the first 50 steps and
 then falls. The loss should drop faster over the first few hundred steps than
 the constant-rate run did.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add src/bin/train.rs
@@ -1031,7 +1006,7 @@ same number of tokens, which is the only reason to spend the tokens.
 
 ---
 
-## Task 6: BF16 activation storage
+## Task 6: BF16 activation storage — CLOSED, see docs/baseline.md
 
 **Do not start this task until Task 0 says MFU is below about 25%.** If the
 clean baseline shows the device already well fed, this is a large change for
@@ -1112,7 +1087,7 @@ shows a compute-bound step, close to nothing. Task 0 tells you which.
 
 ---
 
-## Task 7: One batched GEMM across all heads
+## Task 7: One batched GEMM across all heads — CLOSED, see docs/baseline.md
 
 `forward_block` runs `for head in 0..heads` around
 `gemm_rhs_transposed_batched` (`gpu_model.rs:1230`) and again around
@@ -1186,7 +1161,7 @@ tells you which before you spend the day.
 
 ---
 
-## Task 8: Data and the run itself
+## Task 8: Data and the run itself — NOT STARTED, needs your decisions
 
 Throughput work is only worth doing if there are tokens to spend it on. Your
 corpus is 1.2 GB of cloned Rust repositories — 368M tokens. A 50B-token target
@@ -1274,28 +1249,35 @@ X restart, or a stray Ctrl-C.
 
 ---
 
-## What This Adds Up To
+## What This Added Up To
 
-Measured, and compounding: dense over MoE (+14%) and a 16k vocabulary (+10%)
-give about **+25%** for two one-line changes, at the cost of having to retrain
-the tokenizer.
+Implemented and measured, all on an idle RTX 3060:
 
-Unmeasured, and the reason Task 0 comes first: running without a competing
-job on the GPU is plausibly **+100%**, and it costs nothing but stopping the
-other run.
+| Change | Before | After |
+|---|---|---|
+| Idle GPU instead of a shared one | 21295 tok/s | 43704 tok/s |
+| Checkpoint size (55.2M model) | 668 MB JSON | 221 MB binary |
+| Checkpoint save / load | 1.23s / 1.58s | 0.05s / 0.21s |
+| Trainer anonymous RSS | 2.78 GB | 849 MB |
+| Startup to first training step | ~3.5 min | 36 s |
+| Dense feed-forward instead of MoE | 40115 tok/s | 43704 tok/s |
+| Corpus ceiling | RAM-bound | disk-bound |
 
-Structural: Tasks 2 and 8 do not make anything faster. They are what makes a
-25B-token run possible at all, on 32 GB of RAM and 116 GB of disk.
+Gradient accumulation reproduces the un-accumulated loss curve exactly for a
+dense model: batch 64 x accumulate 1 and batch 16 x accumulate 4 print the
+same `lm_loss` at every reported step, at 105778 and 94118 tok/s. The cost of
+splitting is 11% throughput; what it buys is an effective batch that no longer
+has to fit in 12 GB.
 
-Tasks 6 and 7 are held behind a measurement on purpose. Under contention the
-step looked bandwidth-starved at ~15% MFU; on an idle card it may not be, and
-half a week of kernel work for nothing is exactly the outcome Task 0 exists
-to prevent.
+Not implemented, deliberately: Tasks 6 and 7. The measurement they were gated
+on came back at 30.7-37.0% MFU across every shape in the sweep, including the
+128-sequence batch that issues the fewest launches per token. A device that
+well fed does not have 1.3x sitting in its activation traffic.
 
-One thing worth saying plainly: 55M parameters trained on 25B tokens lands
-somewhere around SmolLM2-135M, below it on most measures. That is a model
-that writes plausible short functions, not a coding assistant. If a usable
-assistant is the actual goal rather than the experience of training one from
-scratch, fine-tuning Qwen3-0.6B on the same corpus is a few hours on this card
-instead of a few weeks. Both are worth doing; they are not the same project,
-and this plan is for the second one.
+Still open: Task 8. It needs decisions only you can make -- how much of the
+115 GB free disk to spend, whether to retrain the tokenizer at vocabulary
+16384 (which invalidates every existing checkpoint), and whether the target is
+a model trained from scratch or a usable coding assistant. Those are not the
+same project: 55M parameters on 25B tokens lands near SmolLM2-135M, which
+writes plausible short functions and is not an assistant. Fine-tuning
+Qwen3-0.6B on the same corpus is a few hours on this card.
