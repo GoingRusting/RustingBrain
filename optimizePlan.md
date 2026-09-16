@@ -1249,6 +1249,174 @@ X restart, or a stray Ctrl-C.
 
 ---
 
+## Task 9: Fuse the attention softmax — NOT STARTED, this is the real gap
+
+**Where this came from:** a fair, param-matched (101.7M, dense-only, bf16,
+XLA/`torch.compile` on) three-way speed comparison against TensorFlow and
+PyTorch at five (batch, seq_len) shapes, all on this same RTX 3060. RustingBrain
+lost every shape, 1.4-1.9x:
+
+| batch | seq | RustingBrain tok/s | TF tok/s | PyTorch tok/s |
+|---|---|---|---|---|
+| 1 | 512  | 9229  | 15389 | 14533 |
+| 1 | 1024 | 9038  | 16953 | 17480 |
+| 4 | 512  | 14179 | 22759 | 21823 |
+| 4 | 1024 | 11905 | 20140 | 23121 |
+| 8 | 512  | 15760 | 23937 | 24247 |
+
+That rules out an unfair test (same params, same batch, same dtype, both
+competitors at their fastest compiled path) and points at something inside
+the kernels themselves. `nsys profile --stats=true` on
+`./target/release/bench --gpu --mixed-precision --d-model 768 --n-layers 16
+--n-heads 12 --n-kv-heads 4 --head-dim 64 --d-ff 1408 --seq-len 1024
+--batch-size 4 --steps 20 --gpu-memory-budget-mib 9000` names the culprit
+directly, in `cuda_gpu_kern_sum`:
+
+| Kernel | Instances | Total time | % of GPU time |
+|---|---|---|---|
+| `causal_softmax_bwd` | 336 | 640.0 ms | 9% |
+| `causal_softmax_lse` | 336 | 537.5 ms | 7% |
+| `causal_probs_from_lse` | 336 | 343.3 ms | 4% |
+
+Three custom kernels, **20% of all GPU time**, spent entirely on attention
+softmax — none of it is the QK^T or AV matmul, which show up separately as
+`cutlass::Kernel2<...>` GEMMs. 336 instances = 16 layers x 21 steps (20 timed
++ 1 warmup), so this is once per layer per step, not a one-off setup cost.
+
+**Why this is the gap and not the GEMMs:** the GEMM total (the nine
+`cutlass::Kernel2<...>` variants) is roughly 67% of GPU time, which is in the
+expected range for a transformer this size and is not obviously improvable —
+Task 7 already measured attention-GEMM launch overhead and closed it as not
+worth doing. Softmax is not supposed to cost anywhere near 20%; in a fused
+attention kernel (PyTorch's `scaled_dot_product_attention`, which
+`torch_bench_300m.py` uses, or TF's XLA-fused softmax) the max/exp/sum/divide
+happen as an epilogue *inside* the same kernel that does QK^T, at bandwidth
+cost close to zero. RustingBrain instead does it as three separate kernel
+launches with two full `[rows, rows]` round trips through global memory
+(`causal_softmax_lse` writes the LSE-normalized probabilities, a later step
+reads them, `causal_probs_from_lse` reads the LSE and rematerializes probs
+for the backward pass, `causal_softmax_bwd` reads and writes the full score
+matrix again). That is the 1.4-1.9x, or close to all of it: 20% of GPU time
+on an op that a competing framework gets nearly for free is roughly the same
+order of magnitude as the measured gap.
+
+**Files:**
+- Kernel source (inline CUDA-C strings compiled via NVRTC, not `.cu` files):
+  `src/cuda_training.rs:109` (`causal_softmax_lse`), `src/cuda_training.rs:123`
+  (`causal_softmax_bwd`), `src/cuda_training.rs:138` (`causal_probs_from_lse`)
+- Launch sites: `src/gpu_model.rs:604` (`causal_softmax_backward` wrapper),
+  `:627` (`causal_softmax_lse` wrapper), `:650` (`causal_probs_from_lse`
+  wrapper); called from forward at `:1249`, `:2147`, and backward at `:2208`
+  (plus test call sites at `:2737`, `:2766`, `:3046`, `:3096`)
+
+- [x] **Step 1: Confirm with your own profile before changing anything** — CONFIRMED, see `docs/baseline.md`. 21.3% of 7.00 s of GPU kernel time, and all three kernels measured at 302-384 GB/s against a 360 GB/s card, so the cost is the `[seq_len, seq_len]` FP32 round trip itself, not the kernels.
+
+```bash
+cd ~/Rusting/RustingBrain
+nsys profile --stats=true -o /tmp/attn_profile ./target/release/bench \
+  --gpu --mixed-precision --d-model 768 --n-layers 16 --n-heads 12 \
+  --n-kv-heads 4 --head-dim 64 --d-ff 1408 --seq-len 1024 --batch-size 4 \
+  --steps 20 --gpu-memory-budget-mib 9000
+```
+
+Read the `cuda_gpu_kern_sum` table. Expect the three `causal_softmax_*`
+kernels combined near 20% of total GPU time. If your numbers disagree
+meaningfully, stop and re-diagnose — do not proceed on a stale profile.
+
+- [ ] **Step 2: Fuse forward softmax into the QK^T/AV pass**
+
+The goal is a single-pass (or two-pass, online-softmax style) fused attention
+kernel — the same shape as flash-attention: compute scores for a tile,
+update a running max/sum, and accumulate the output, without ever writing
+the full `[rows, rows]` score matrix to global memory. This replaces
+`causal_softmax_lse` (`cuda_training.rs:109`) and its round trip. `head_dim`
+is fixed at 64 across every existing checkpoint and config
+(`src/transformer.rs` validation), which simplifies the tile design
+considerably — this does not need to handle arbitrary head dims.
+
+- [ ] **Step 3: Fuse or recompute-in-place for the backward pass**
+
+`causal_probs_from_lse` (`cuda_training.rs:138`) exists specifically to
+rematerialize probabilities from the saved LSE rather than caching the full
+probability matrix — that trade was already made once. The remaining cost is
+`causal_softmax_bwd` itself (`cuda_training.rs:123`), the single most
+expensive kernel of the three at 640ms/9%. A fused backward that combines the
+LSE-recompute and the softmax-gradient math into one kernel removes one of
+the two remaining round trips.
+
+- [ ] **Step 4: Gate on the parity tests**
+
+```bash
+cargo test --lib gpu_forward_matches_cpu_or_skips_without_device
+cargo test --lib gpu_backward_matches_cpu_or_skips_without_device
+cargo test --lib a_batched_gpu_train_step_matches_the_host_or_skips_without_device
+```
+
+Expected: all pass at the existing `1e-3` tolerance. This changes how
+softmax is computed, not what it computes, so it should not need any
+tolerance widening — unlike Task 6's bf16 change. If it does, the fusion is
+wrong, not the tolerance.
+
+- [ ] **Step 5: Re-profile and re-run the three-way comparison**
+
+```bash
+nsys profile --stats=true -o /tmp/attn_profile_after ./target/release/bench \
+  --gpu --mixed-precision --d-model 768 --n-layers 16 --n-heads 12 \
+  --n-kv-heads 4 --head-dim 64 --d-ff 1408 --seq-len 1024 --batch-size 4 \
+  --steps 20 --gpu-memory-budget-mib 9000
+./scripts/run_all_shapes.sh   # in RustingLLM, if kept
+```
+
+Record the new `causal_softmax_*` percentage and the new tok/s at
+batch=4/seq=1024 (baseline: 11905 tok/s here, vs TF 20140 and PyTorch 23121)
+in `docs/baseline.md`.
+
+**Expected gain:** if the fused kernel gets softmax's cost down near the
+GEMMs' own epilogue cost (the way PyTorch's SDPA and TF's XLA fusion do),
+this should recover most of the ~20% of GPU time it currently spends, closing
+a large fraction of the measured 1.4-1.9x gap. It will not close all of it —
+see Task 10 for the rest.
+
+---
+
+## Task 10: Stop syncing to host every step — NOT STARTED, secondary, measure first
+
+**Where this came from:** the same `nsys profile` run's `cuda_api_sum` table
+shows `cuMemcpyDtoHAsync_v2` at 42 calls averaging **75.5 ms each**, 3.17s
+total — 43% of all CPU-side CUDA API time. 42 = 21 steps x 2 scalars. This is
+`train_step_batch` (`src/transformer.rs:830`) fetching `lm_loss` and
+`auxiliary_loss` back to the host every step via `gpu_model::train_step`.
+
+Each call is a full pipeline drain: the CPU blocks until every kernel queued
+so far for that step has finished before it can read the 4-byte result, so
+the CPU cannot get ahead and queue the next step's kernels while this step's
+still running on the device. In this profile the GPU kernel-time sum (~7.14s
+across 21 steps) already accounts for essentially all of the measured wall
+time, so on this card, with this workload, there is no idle gap to recover —
+but it does rule out any cross-step overlap or CUDA Graph replay, both of
+which the `torch.compile`/XLA paths get for free by capturing many steps'
+kernel sequences ahead of the sync point.
+
+**Do not start this without measuring first** — unlike Task 9, this is not
+yet shown to cost time on this hardware, only shown to block a class of
+optimization (graph capture / step overlap) that competitors use.
+
+- [ ] **Step 1: Measure whether removing the per-step sync changes tok/s**
+
+Fetch `lm_loss` only every N steps (e.g. for logging) instead of every step,
+keep training stepping without reading it back, and re-run `bench`. If tok/s
+does not move, this queue is already saturated and Task 10 is not worth
+doing — record that in `docs/baseline.md` and stop.
+
+- [ ] **Step 2: If it does move, look at CUDA Graph capture**
+
+`cudarc` exposes stream capture; a training step at a fixed shape (fixed
+batch/seq_len, which `bench` and most training runs use) is exactly the kind
+of static, repeated kernel sequence CUDA Graphs are for. This is a bigger
+change than Step 1 and should only be attempted if Step 1 shows a real gap.
+
+---
+
 ## What This Added Up To
 
 Implemented and measured, all on an idle RTX 3060:
