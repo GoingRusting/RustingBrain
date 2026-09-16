@@ -1323,7 +1323,7 @@ Read the `cuda_gpu_kern_sum` table. Expect the three `causal_softmax_*`
 kernels combined near 20% of total GPU time. If your numbers disagree
 meaningfully, stop and re-diagnose — do not proceed on a stale profile.
 
-- [ ] **Step 2: Fuse forward softmax into the QK^T/AV pass**
+- [x] **Step 2: Fuse forward softmax into the QK^T/AV pass** — DONE, `src/cuda_flash.rs` `flash_attention_fwd`, a tensor-core online-softmax kernel blocked over query tiles. `causal_softmax_lse` and the two per-head forward GEMMs are gone from the profile. Worth 1.15x on its own.
 
 The goal is a single-pass (or two-pass, online-softmax style) fused attention
 kernel — the same shape as flash-attention: compute scores for a tile,
@@ -1334,7 +1334,7 @@ is fixed at 64 across every existing checkpoint and config
 (`src/transformer.rs` validation), which simplifies the tile design
 considerably — this does not need to handle arbitrary head dims.
 
-- [ ] **Step 3: Fuse or recompute-in-place for the backward pass**
+- [x] **Step 3: Fuse or recompute-in-place for the backward pass** — DONE, and it took three kernels rather than one: `flash_attention_delta` for the softmax row sum, `flash_attention_dq` blocked over query tiles, `flash_attention_dkv` blocked over key tiles and over the key/value head, which is what keeps grouped-query attention exact without atomics. `causal_probs_from_lse`, `causal_softmax_bwd` and the four per-head backward GEMMs are all gone. This was the larger half of the win, as the profile predicted.
 
 `causal_probs_from_lse` (`cuda_training.rs:138`) exists specifically to
 rematerialize probabilities from the saved LSE rather than caching the full
@@ -1344,7 +1344,7 @@ expensive kernel of the three at 640ms/9%. A fused backward that combines the
 LSE-recompute and the softmax-gradient math into one kernel removes one of
 the two remaining round trips.
 
-- [ ] **Step 4: Gate on the parity tests**
+- [x] **Step 4: Gate on the parity tests** — PASS, all 144 lib tests at the existing tolerances, no widening. Those three parity tests do not themselves reach the fused path (it needs `head_dim` 64 under mixed precision, and they use neither), so two tests were added that do: `fused_attention_matches_the_three_kernel_path_or_skips_without_device` and `fused_attention_backward_matches_the_three_kernel_path_or_skips_without_device`, plus `the_fused_module_compiles_or_skips_without_device`, without which an NVRTC failure would leave the fused path silently `None` and every parity test would pass having compared the old path against itself.
 
 ```bash
 cargo test --lib gpu_forward_matches_cpu_or_skips_without_device
@@ -1357,7 +1357,7 @@ softmax is computed, not what it computes, so it should not need any
 tolerance widening — unlike Task 6's bf16 change. If it does, the fusion is
 wrong, not the tolerance.
 
-- [ ] **Step 5: Re-profile and re-run the three-way comparison**
+- [x] **Step 5: Re-profile and re-run the three-way comparison** — DONE, see `docs/baseline.md`. **1.70x**, 7137 to 12070 tok/s, paired, with the losses agreeing to 0.006. The card was not idle during the runs, so the absolute figure is still to be taken; the fused path on a busy card already beats the 11905 tok/s the old path measured on an idle one. Attention is now 17.8% of GPU time across three kernels, and the three model projection GEMMs at 51% between them are what is left between this and PyTorch.
 
 ```bash
 nsys profile --stats=true -o /tmp/attn_profile_after ./target/release/bench \
