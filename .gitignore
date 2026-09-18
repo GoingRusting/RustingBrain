@@ -8,4 +8,11 @@
 perf.data
 perf.data.old
 flamegraph.svg
-improvementPlan.md
+docs/improvement-plan.md
+docs/improvement-plan.archive.md
+docs/optimize-plan.md
+
+# Written by `cargo run --example language_model -- train`
+lm.rbw
+lm.rbw.opt
+lm.vocab
