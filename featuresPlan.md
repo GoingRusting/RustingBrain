@@ -243,9 +243,10 @@ embedding over patches in reading order, not a learned table — the table is a
 rather than a class token, which is a parameter and a special-cased row fewer.
 
 The kernel risk below did not have to be solved: the CUDA path refuses a
-bidirectional model, so a vision transformer trains on the CPU. That is the
-gap worth closing next for this item, and it is the same non-causal flash
-kernel the section names.
+bidirectional model, so a vision transformer trains on the CPU. The non-causal
+kernel has since landed (see the encoder-only item), so what is left is giving
+`VisionTransformer` a `to_cuda` that routes its blocks through `gpu_model` the
+way `TransformerLm` does.
 
 **What:** Patch embedding, learned or sinusoidal position embeddings, and a
 non-causal attention mask, feeding the existing transformer block stack.
@@ -335,6 +336,13 @@ which is what a whole-word or span objective needs. There is no new head: the
 existing unembedding already maps a hidden state to the vocabulary, and the loss
 is the same cross-entropy reading a row's own token rather than the next one —
 `causal_lm_loss` was split so both share one softmax pass.
+
+*And on the device:* the three fused attention kernels take a `causal` flag,
+which moves one loop bound in each and narrows the mask to the ragged tail of
+the sequence, and the three-kernel fallback already took one. `to_cuda` no
+longer refuses a bidirectional model, so `train_step_masked` trains on the
+card. The parity tests run both masks against the host, and fail if the flag is
+dropped on the way into the kernel.
 
 So this item is done, except that a real encoder also wants a `[CLS]`-style
 pooled output and a classification head on top of it, which is a linear layer
