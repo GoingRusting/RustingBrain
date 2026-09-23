@@ -243,10 +243,15 @@ embedding over patches in reading order, not a learned table — the table is a
 rather than a class token, which is a parameter and a special-cased row fewer.
 
 The kernel risk below did not have to be solved: the CUDA path refuses a
-bidirectional model, so a vision transformer trains on the CPU. The non-causal
-kernel has since landed (see the encoder-only item), so what is left is giving
-`VisionTransformer` a `to_cuda` that routes its blocks through `gpu_model` the
-way `TransformerLm` does.
+bidirectional model, so a vision transformer trained on the CPU. Both halves of
+that have since landed: the non-causal kernel (see the encoder-only item), and
+`VisionTransformer::to_cuda`, which runs the block stack through the same
+`gpu_model` code `TransformerLm` does. The patch projection, the final norm,
+the pooling and the head stay on the host, which costs one upload and one
+download of the hidden states per pass and saves a device path for four layers
+that are one small matmul each. Measured against the host after an SGD step,
+the FP32 device path is 1.4e-6 away and the BF16 one, which takes the fused
+kernels, 1.4e-2.
 
 **What:** Patch embedding, learned or sinusoidal position embeddings, and a
 non-causal attention mask, feeding the existing transformer block stack.
