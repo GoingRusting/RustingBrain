@@ -297,9 +297,10 @@ cleanly.
 *Landed since this was written:* `Dataset::from_image_folder` (`src/dataset.rs`,
 behind `--features images`) — directory-per-class, PNG/JPEG decode in parallel,
 resize, grayscale or RGB, flattened into a `Dataset` with the class names. That
-is everything below except the augmentations, of which `Dataset::flip_horizontal`
-and `Dataset::standardize` have since landed; random crops and rotations still
-want a batch-yielding loader rather than a one-shot decode into memory.
+is everything below. `Dataset::flip_horizontal` and `Dataset::standardize` came
+next, and random crops and rotations are `Augment`, a `BatchSource` that wraps
+any other one and redraws a shift and a turn for every image of every batch,
+seeded per epoch so a resumed run sees the same images.
 
 **What:** A directory-per-class loader, decoding, resize, and the standard
 augmentations (crop, flip, normalize).
