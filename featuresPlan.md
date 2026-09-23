@@ -486,10 +486,12 @@ swapped between steps, so Lion writes `moment1` and leaves `moment2` at zero and
 saves elsewhere. An optimizer with state of a different shape, Shampoo being the
 obvious one, is where the format question actually arrives.
 
-Lion is CPU only. The CUDA and Metal paths report `UnsupportedCuda` and
-`UnsupportedMetal` rather than quietly taking an Adam step; each needs an
-elementwise kernel of one line, which is cheap to write and was not worth
-writing untested.
+Lion now runs on CUDA as well, through one elementwise kernel that both the
+dense `Network` path and the transformer's `DeviceParam` share, and two tests
+check it against the host after a step. A sign flipped in the kernel moves
+every weight by twice the learning rate, and both tests catch that. Metal
+still reports `UnsupportedMetal`: its kernel would be as short, but this
+machine cannot run it, and it was not worth writing untested.
 
 ### ONNX export
 
